@@ -4,17 +4,17 @@ This repository contains the foundational infrastructure for **Phase 0 (Environm
 
 ## 1. Prerequisites
 
-- Python 3.14+
+- Python 3.10+
 - Docker Desktop with Docker Compose support
 - Git Bash, PowerShell, or another shell
 
 ## 2. Start the PostgreSQL/TimescaleDB Container
 
 1. Open a terminal in the project root.
-2. Set the same strong database password used by the migration script:
+2. Set the database password:
    - PowerShell:
      ```powershell
-   $env:DB_PASSWORD = "replace_with_a_strong_password"
+     $env:DB_PASSWORD = "replace_with_a_strong_password"
      ```
 3. Start the database service:
    ```powershell
@@ -27,9 +27,9 @@ This repository contains the foundational infrastructure for **Phase 0 (Environm
 
 ## 3. Activate the Python Virtual Environment
 
-1. Create the virtual environment (already done during setup if present):
+1. Create the virtual environment:
    ```powershell
-   C:/Users/HAI/AppData/Local/Programs/Python/Python314/python.exe -m venv .venv
+   python -m venv .venv
    ```
 2. Activate it:
    ```powershell
@@ -42,7 +42,7 @@ This repository contains the foundational infrastructure for **Phase 0 (Environm
 
 ## 4. Configure Environment Variables
 
-Create a `.env` file in the project root with the following values:
+Create a `.env` file in the project root:
 
 ```env
 DB_HOST=localhost
@@ -57,37 +57,59 @@ DB_POOL_TIMEOUT=30
 DB_POOL_RECYCLE=1800
 ```
 
-The `DB_PASSWORD` value is used by both Docker Compose and the migration script.
-If the database volume already exists and was created with another password, reset
-the database role password inside the running container or recreate the volume.
-
-## 5. Initialize the Asset Registry Schema
-
-Run the migration script:
+## 5. Initialize the Asset Registry
 
 ```powershell
 python registry/init_registry.py
 ```
 
-Expected successful output:
+This runs `registry/schema.sql` (creates tables, indexes, view) then `registry/seed.sql`
+(inserts PH-01 data). Both files are idempotent.
+
+Expected output:
 
 ```text
-INFO | registry.init_registry | Starting registry schema initialization.
-INFO | registry.init_registry | Registry schema initialized successfully.
+INFO | registry.init_registry | === ENTWINE Asset Registry Initialization ===
+INFO | registry.init_registry | Executing schema.sql (schema.sql) …
+INFO | registry.init_registry | schema.sql executed successfully.
+INFO | registry.init_registry | Executing seed.sql (seed.sql) …
+INFO | registry.init_registry | seed.sql executed successfully.
+INFO | registry.init_registry | === Registry initialization complete. ===
 ```
 
-This creates the schema idempotently, inserts the `KCT Powerhouse Block`
-building and `PH-01` meter seed data, and writes detailed logs to
-`logs/init_registry.log`.
-
-## 6. Stop the Database Service (Optional)
+## 6. Validate the Registry
 
 ```powershell
-docker compose down
+$env:PYTHONUTF8=1
+python registry/validate_registry.py
 ```
 
-To remove the persisted database volume as well:
+A passing run prints `MODULE 1: PASS`.
+
+> **Windows note:** `$env:PYTHONUTF8=1` is required in PowerShell to correctly render
+> the Unicode box-drawing characters in the output. Without it you will see a
+> `UnicodeEncodeError` on cp1252 consoles.
+
+For detailed setup instructions, validation queries, PH-01 metadata, and
+dataset mapping notes, see [`registry/README.md`](registry/README.md).
+
+## 7. Repository Structure
+
+```
+entwine/
+  registry/        # Module 1 — Asset Registry (schema, seed, mapping, validation)
+  ingestion/       # Module 2 — State Layer data loading (future)
+  models/          # Module 3 — GridReason / GrCF / CAFA (future)
+  forecasting/     # 3-month load prediction (future)
+  interrogation/   # Agentic / RAG layer (future)
+  dashboard/       # Frontend (future)
+  logs/            # Experiment and validation logs
+  Documents/       # Mentor reference documents (read-only)
+```
+
+## 8. Stop the Database Service
 
 ```powershell
-docker compose down -v
+docker compose down          # stops container, keeps volume
+docker compose down -v       # stops container AND deletes volume (full reset)
 ```
