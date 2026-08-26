@@ -1,5 +1,12 @@
+# ── Module 1 (Asset Registry) ─────────────────────────────────────────────────
 greenlet==3.5.5
 psycopg2-binary==2.9.12
 python-dotenv==1.2.3
 SQLAlchemy==2.0.52
 typing_extensions==4.16.0
+
+# ── Module 2 (Historical State Layer) ─────────────────────────────────────────
+xlrd==2.0.1             # BIFF8 .xls reading — all POWERHOUSE_1 and daily-report XLS files
+pandas==2.2.3           # Batch staging and CSV/XLS data manipulation
+chardet==5.2.0          # Byte-level encoding detection for CSV files (UTF-8-SIG etc.)
+pytz==2026.3.post1      # IST (Asia/Kolkata) → UTC TIMESTAMPTZ normalisation

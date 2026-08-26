@@ -1,115 +1,165 @@
-# ENTWINE Energy Digital Twin - Phase 0 Setup
+# ENTWINE Energy Digital Twin
 
-This repository contains the foundational infrastructure for **Phase 0 (Environment Setup)** and **Module 1 (Asset Registry)**.
+ENTWINE is a full-lifecycle energy digital twin platform integrating structural asset registration, high-frequency historical state ingestion, physics-informed AI modeling, forecasting, and natural language interrogation.
+
+---
 
 ## 1. Prerequisites
 
 - Python 3.10+
-- Docker Desktop with Docker Compose support
-- Git Bash, PowerShell, or another shell
+- Docker Desktop with Docker Compose
+- PowerShell, Bash, or terminal shell with UTF-8 support
 
-## 2. Start the PostgreSQL/TimescaleDB Container
+---
+
+## 2. Start PostgreSQL / TimescaleDB
 
 1. Open a terminal in the project root.
-2. Set the database password:
-   - PowerShell:
-     ```powershell
-     $env:DB_PASSWORD = "replace_with_a_strong_password"
-     ```
-3. Start the database service:
+2. Set the database password (or configure `.env`):
+   ```powershell
+   $env:DB_PASSWORD = "replace_with_a_strong_password"
+   ```
+3. Start the containerized database service:
    ```powershell
    docker compose up -d
    ```
-4. Verify service health:
+4. Verify service status:
    ```powershell
    docker compose ps
    ```
 
-## 3. Activate the Python Virtual Environment
+---
 
-1. Create the virtual environment:
+## 3. Environment & Virtual Environment Setup
+
+1. Create and activate the Python virtual environment:
    ```powershell
    python -m venv .venv
-   ```
-2. Activate it:
-   ```powershell
    .\.venv\Scripts\Activate.ps1
    ```
-3. Install pinned dependencies:
+2. Install pinned dependencies:
    ```powershell
    pip install -r requirements.txt
    ```
+3. Configure your `.env` file:
+   ```env
+   DB_HOST=localhost
+   DB_PORT=5432
+   DB_NAME=entwine_twin
+   DB_USER=entwine_admin
+   DB_PASSWORD=replace_with_a_strong_password
+   DB_SSLMODE=prefer
+   DB_POOL_SIZE=5
+   DB_MAX_OVERFLOW=10
+   DB_POOL_TIMEOUT=30
+   DB_POOL_RECYCLE=1800
+   ```
 
-## 4. Configure Environment Variables
+---
 
-Create a `.env` file in the project root:
-
-```env
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=entwine_twin
-DB_USER=entwine_admin
-DB_PASSWORD=replace_with_a_strong_password
-DB_SSLMODE=prefer
-DB_POOL_SIZE=5
-DB_MAX_OVERFLOW=10
-DB_POOL_TIMEOUT=30
-DB_POOL_RECYCLE=1800
-```
-
-## 5. Initialize the Asset Registry
+## 4. Module 1: Asset Registry Initialization
 
 ```powershell
+# 1. Initialize schema and static seed data
 python registry/init_registry.py
-```
 
-This runs `registry/schema.sql` (creates tables, indexes, view) then `registry/seed.sql`
-(inserts PH-01 data). Both files are idempotent.
-
-Expected output:
-
-```text
-INFO | registry.init_registry | === ENTWINE Asset Registry Initialization ===
-INFO | registry.init_registry | Executing schema.sql (schema.sql) …
-INFO | registry.init_registry | schema.sql executed successfully.
-INFO | registry.init_registry | Executing seed.sql (seed.sql) …
-INFO | registry.init_registry | seed.sql executed successfully.
-INFO | registry.init_registry | === Registry initialization complete. ===
-```
-
-## 6. Validate the Registry
-
-```powershell
+# 2. Validate Module 1 integrity
 $env:PYTHONUTF8=1
 python registry/validate_registry.py
 ```
 
-A passing run prints `MODULE 1: PASS`.
+Expected output: `MODULE 1: PASS`
 
-> **Windows note:** `$env:PYTHONUTF8=1` is required in PowerShell to correctly render
-> the Unicode box-drawing characters in the output. Without it you will see a
-> `UnicodeEncodeError` on cp1252 consoles.
+---
 
-For detailed setup instructions, validation queries, PH-01 metadata, and
-dataset mapping notes, see [`registry/README.md`](registry/README.md).
+## 5. Module 2: Historical State Layer Ingestion
+
+Module 2 ingests all historical energy telemetry, daily summary workbooks, alarms, events, and incidents from `real time energy data/` into TimescaleDB and PostgreSQL.
+
+### Execution Workflow
+
+```powershell
+# 1. Apply Module 2 database migrations (creates hypertables, measurement_sources, audit tables)
+$env:PYTHONUTF8=1; python -m ingestion.run --migrate
+
+# 2. Register mapped assets and create mapping snapshots with approval provenance
+$env:PYTHONUTF8=1; python -m ingestion.run --register-assets
+
+# 3. Dry-run ingestion simulation (profiles and validates parsing without state writes)
+$env:PYTHONUTF8=1; python -m ingestion.run --dry-run
+
+# 4. Full historical ingestion of all 29 source files
+$env:PYTHONUTF8=1; python -m ingestion.run --ingest
+
+# 5. Run Module 2 automated quality gates (15 assertions)
+$env:PYTHONUTF8=1; python -m ingestion.run --validate
+
+# 6. Generate structured reconciliation report
+$env:PYTHONUTF8=1; python -m ingestion.run --reconcile
+
+# 7. Idempotent rerun (safely skips already-ingested files using SHA-256 checksums)
+$env:PYTHONUTF8=1; python -m ingestion.run --rerun
+```
+
+### Run Unit and Integration Tests
+
+```powershell
+$env:PYTHONUTF8=1; python -m unittest discover tests
+```
+
+---
+
+## 6. Architecture & Data Flow
+
+```
+real time energy data/
+├── POWERHOUSE_1/*.xls         ──> [ tabular_xls.py ]    ──> interval_telemetry (TimescaleDB hypertable)
+├── daily energy report/*.xls  ──> [ daily_xls.py ]      ──> daily_energy_reports (PostgreSQL)
+├── Alarms/1st_fllor_*.csv     ──> [ measurement_csv.py] ──> interval_telemetry (narrow format)
+└── Alarms/Alarm|Event|*.csv   ──> [ alarm_csv.py ]      ──> operational_events (SHA-256 fingerprinted)
+                                           │
+                                    [ writer.py ] (Batch tx, 1000 rows/batch, ON CONFLICT DO NOTHING)
+                                           │
+                                 [ measurement_sources ] ──> meters / equipment (Module 1 lookup)
+                                 [ rejected_records ]    <── Quarantined feeders (FROM/TO_POWERHOUSE_2)
+                                 [ source_files ]        <── SHA-256 manifest & processing status
+```
+
+---
 
 ## 7. Repository Structure
 
 ```
-entwine/
-  registry/        # Module 1 — Asset Registry (schema, seed, mapping, validation)
-  ingestion/       # Module 2 — State Layer data loading (future)
-  models/          # Module 3 — GridReason / GrCF / CAFA (future)
-  forecasting/     # 3-month load prediction (future)
-  interrogation/   # Agentic / RAG layer (future)
-  dashboard/       # Frontend (future)
-  logs/            # Experiment and validation logs
-  Documents/       # Mentor reference documents (read-only)
+ENTWINE/
+├── registry/          # Module 1: Asset Registry (schema, seed, mapping, validation)
+├── migrations/        # Versioned SQL migrations (Module 2 state layer DDL)
+├── ingestion/         # Module 2: Historical State Layer Ingestion Engine
+│   ├── readers/       # Parsers for tabular XLS, daily XLS, alarms/events CSV, and measurement CSV
+│   ├── config.py      # Database settings and paths
+│   ├── discover.py    # Source file discovery and SHA-256 calculation
+│   ├── mapping.py     # asset_mapping.csv validator and loader
+│   ├── migrate.py     # Checksum-protected migration runner
+│   ├── normalize.py   # IST -> UTC timestamp normalisation and unit extraction
+│   ├── quality.py     # 15 automated data quality gate checks
+│   ├── reconcile.py   # Reconciliation report generator
+│   ├── register_assets.py # Mapping-driven static asset registration
+│   ├── run.py         # Unified CLI entry point
+│   └── writer.py      # Transactional batch writer
+├── tests/             # Comprehensive unit and integration test suite
+├── logs/              # Source profiles, validation logs, and reconciliation reports
+├── models/            # Module 3: GridReason / GrCF / CAFA (future)
+├── forecasting/       # 3-Month Load Forecasting Layer (future)
+├── interrogation/     # Agentic & RAG Natural Language Interrogation (future)
+├── dashboard/         # Real-time Web Twin Visualization (future)
+├── Documents/         # Mentor reference specifications (read-only)
+├── docker-compose.yml # TimescaleDB & PostgreSQL container configuration
+└── requirements.txt   # Pinned project dependencies
 ```
 
-## 8. Stop the Database Service
+---
+
+## 8. Stopping the Database
 
 ```powershell
-docker compose down          # stops container, keeps volume
-docker compose down -v       # stops container AND deletes volume (full reset)
+docker compose down          # stops container, preserves volume data
 ```
