@@ -1,0 +1,53 @@
+
+
+> **ENTWINE Digital Twin — Master Agent Workflow**
+> **Context:** You are an expert AI software engineer building the ENTWINE Energy Digital Twin. Your code must be production-ready, strictly typed, and documented to academic publishing standards. Do not proceed to a new phase until the current phase is explicitly verified.
+> ### Phase 0 & Module 1 — Foundation & Registry
+> 
+> 
+> * **Environment Setup:** Initialize a Python virtual environment and generate a strictly pinned `requirements.txt` containing database and ORM dependencies.
+> 
+> 
+> * **Directory Scaffold:** Create the exact required structure: `registry/`, `ingestion/`, `models/`, `forecasting/`, `interrogation/`, `dashboard/`, and `logs/`.
+> 
+> 
+> * **Database Initialization:** Deploy a local PostgreSQL/TimescaleDB instance and write an idempotent `registry/init_registry.py` script to execute `asset_registry_schema.sql`, seeding the `PH-01` metadata.
+> 
+> 
+> 
+> 
+> ### Phase 1 & Module 2 — Historical Ingestion (PH-01)
+> 
+> 
+> * **Data Parsing:** Inside `ingestion/`, create a pipeline to parse the historical KCT Powerhouse `PH-01` CSV and XLS energy reports.
+> 
+> 
+> * **State Layer Insertion:** Clean the parsed data (standardize to UTC, handle missing values) and perform a bulk-insert into the TimescaleDB state layer, verifying data completeness.
+> 
+> 
+> 
+> 
+> ### Phase 1 & Module 3 — Baseline Model Validation
+> 
+> 
+> * **Model Integration:** Place the existing GridReason, GrCF, and CAFA scripts inside the `models/` directory.
+> 
+> 
+> * **Execution Gate:** Run GridReason against the `PH-01` state data pulled directly from the database, confirming it reproduces the validated $F1=0.9524$ baseline.
+> 
+> 
+> * **Explain & Audit:** For any flagged anomalies, trigger GrCF for counterfactuals and CAFA for equity audits (verifying the applicability threshold $\rho > 1$), logging all output traces meticulously in `logs/`.
+> 
+> 
+> 
+> 
+> ### Phase 2 & Future Scaling — Automation
+> 
+> 
+> * **Batch Scaling:** Once PH-01 is verified, extend the registry and ingestion scripts to batch-load the remaining 7 campus meters.
+> 
+> 
+> * **Scheduling:** Implement `APScheduler` to run the end-to-end model pipeline continuously across all buildings.
+> 
+> 
+> * **Strict Blockers:** Do not initiate development on the FastAPI dashboard or Interrogation (RAG) layers until the database is producing consistent, logged outputs for all historical data.

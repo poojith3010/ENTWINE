@@ -1,5 +1,19 @@
+# Environments & Caches
 .env
 .venv/
 __pycache__/
 *.py[cod]
+
+# Logs
 logs/*.log
+
+# Confidential Notebooks
+cafa-kct-powerhouse.ipynb
+grcf-kct-powerhouse.ipynb
+models/cafa-kct-powerhouse.ipynb
+models/grcf-kct-powerhouse.ipynb
+
+# Real-Time Data 
+real time energy data/
+*.csv
+*.xlsx
