@@ -8,6 +8,7 @@ typing_extensions==4.16.0
 # ── Module 2 (Historical State Layer) ─────────────────────────────────────────
 xlrd==2.0.1             # BIFF8 .xls reading — all POWERHOUSE_1 and daily-report XLS files
 pandas==3.0.5           # Batch staging and CSV/XLS data manipulation
+numpy==2.5.3            # Numerical arrays for ingestion and model features
 chardet==5.2.0          # Byte-level encoding detection for CSV files (UTF-8-SIG etc.)
 pytz==2026.3.post1      # IST (Asia/Kolkata) → UTC TIMESTAMPTZ normalisation
 
@@ -17,6 +18,8 @@ scikit-learn==1.9.1     # Isolation Forest anomaly detection and scaling
 scipy==1.18.1           # Granger F-test statistics
 torch==2.14.0           # LSTM autoencoder and DDPM denoiser
 transformers==4.57.1   # Optional local deterministic GridReason generation
+networkx==3.6.1         # Granger causal graph utilities
+optuna==5.0.0           # Optional research-model hyperparameter tuning
 
 # ── Phase 2 (Presentation Layer) ─────────────────────────────────────────────
 fastapi==0.141.1       # Async REST API framework
@@ -24,3 +27,6 @@ uvicorn==0.35.0        # ASGI development/production server
 asyncpg==0.31.0        # Async PostgreSQL driver for SQLAlchemy
 httpx==0.28.1          # FastAPI endpoint testing client
 gradio==6.27.0         # Interactive Phase 2 dashboard
+
+# ── Development and validation ───────────────────────────────────────────────
+pytest==9.1.1           # Automated test runner
