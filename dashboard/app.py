@@ -218,8 +218,21 @@ CHART_LAYOUT = dict(
 )
 
 
+def _build_counterfactual_times(anomaly_iso: str, num_steps: int) -> list[str]:
+    """Generate ISO timestamps for each counterfactual step (15-min intervals)."""
+    from datetime import timedelta
+    try:
+        base = datetime.fromisoformat(anomaly_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return []
+    return [
+        (base + timedelta(minutes=15 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for i in range(num_steps)
+    ]
+
+
 def build_power_chart(state: DashboardState) -> go.Figure:
-    """Build the Real Power (kW) time-series with anomaly marker."""
+    """Build Observed vs Expected Real Power (kW) as two continuous lines."""
     fig = go.Figure()
 
     if not state.window:
@@ -234,86 +247,46 @@ def build_power_chart(state: DashboardState) -> go.Figure:
 
     times, powers = _hourly_average(state.window, "real_power_kw")
 
-    # ── Historical line ────────────────────────────────────────────────────────
+    # ── Observed line (blue) ───────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=times, y=powers, mode="lines",
-        name="Observed Real Power",
-        line=dict(color=NAVY, width=2),
+        x=times, y=powers, mode="lines+markers",
+        name="Observed (Actual)",
+        line=dict(color=NAVY, width=2.5),
+        marker=dict(size=5, color=NAVY),
         fill="tozeroy",
-        fillcolor="rgba(30,39,97,0.06)",
-        hovertemplate="<b>%{x}</b><br>Real Power: %{y:.2f} kW<extra></extra>",
+        fillcolor="rgba(30,39,97,0.04)",
+        hovertemplate="<b>%{x}</b><br>Observed: %{y:.2f} kW<extra></extra>",
     ))
 
-    # ── Counterfactual overlay (what GrCF says it should have been) ────────────
+    # ── Expected line (green) from counterfactual tensor ───────────────────────
     tensor = state.tensor
     if tensor and state.anomaly_time != "Unknown":
-        try:
-            anomaly_dt = datetime.fromisoformat(state.anomaly_time.replace("Z", "+00:00"))
-            # Step 0 of counterfactual = what the system should look like at anomaly time
-            cf_power = tensor[0][0]  # FEATURE_NAMES[0] = real_power_kw
+        cf_times = _build_counterfactual_times(state.anomaly_time, len(tensor))
+        cf_powers = [step[0] for step in tensor]  # FEATURE_NAMES[0] = Real Power (kW)
 
+        if cf_times:
             fig.add_trace(go.Scatter(
-                x=[state.anomaly_time],
-                y=[cf_power],
-                mode="markers",
-                name=f"GrCF Counterfactual ({cf_power:.2f} kW expected)",
-                marker=dict(color=GREEN, size=14, symbol="diamond",
-                            line=dict(color="white", width=2)),
-                hovertemplate=(
-                    "<b>GrCF Counterfactual</b><br>"
-                    "Expected: %{y:.2f} kW<br>"
-                    "(What the twin predicts normal operation looks like)<extra></extra>"
-                ),
+                x=cf_times, y=cf_powers, mode="lines+markers",
+                name="Expected (GrCF Counterfactual)",
+                line=dict(color=GREEN, width=2.5, dash="solid"),
+                marker=dict(size=5, color=GREEN, symbol="diamond"),
+                hovertemplate="<b>%{x}</b><br>Expected: %{y:.2f} kW<extra></extra>",
             ))
 
-            # Draw expected value line
-            fig.add_hline(
-                y=cf_power,
-                line_dash="dash",
-                line_color=GREEN,
-                line_width=1.5,
-                annotation_text=f"Expected: {cf_power:.1f} kW",
-                annotation_font_color=GREEN,
-            )
-        except (ValueError, IndexError):
-            pass
-
-    # ── Anomaly marker ─────────────────────────────────────────────────────────
+    # ── Anomaly marker (subtle vertical line) ─────────────────────────────────
     if state.anomaly_time != "Unknown":
-        # Find the observed value at anomaly time
-        anomaly_power = None
-        for p in state.window:
-            if state.anomaly_time[:16] in (p.get("time", ""))[:16]:
-                anomaly_power = p.get("real_power_kw")
-                break
-
         fig.add_vline(
             x=state.anomaly_time,
             line_dash="dot",
             line_color=RED,
-            line_width=2.5,
-            annotation_text="&#9650; ANOMALY DETECTED",
+            line_width=2,
+            annotation_text="&#9650; ANOMALY",
             annotation_font_color=RED,
-            annotation_font_size=12,
+            annotation_font_size=11,
         )
 
-        if anomaly_power is not None:
-            fig.add_trace(go.Scatter(
-                x=[state.anomaly_time],
-                y=[anomaly_power],
-                mode="markers",
-                name=f"Anomaly point ({anomaly_power:.2f} kW observed)",
-                marker=dict(color=RED, size=16, symbol="circle",
-                            line=dict(color="white", width=2)),
-                hovertemplate=(
-                    "<b>&#9888; Anomaly Detected</b><br>"
-                    "Observed: %{y:.2f} kW<br>"
-                    "Time: %{x}<extra></extra>"
-                ),
-            ))
-
     fig.update_layout(
-        title=dict(text="Hourly Real Power (kW) — 48-Hour Window Around Anomaly", font=dict(size=15)),
+        title=dict(text="Real Power (kW) — Observed vs Expected", font=dict(size=15)),
         xaxis=dict(title="Time (UTC)", showgrid=True, gridcolor="#e8ecf5"),
         yaxis=dict(title="Real Power (kW)", showgrid=True, gridcolor="#e8ecf5", rangemode="tozero"),
         **CHART_LAYOUT,
@@ -370,7 +343,7 @@ def build_monthly_power_chart(state: DashboardState) -> go.Figure:
 
 
 def build_pf_chart(state: DashboardState) -> go.Figure:
-    """Build the Power Factor (%) time-series with anomaly marker."""
+    """Build Observed vs Expected Power Factor (%) as two continuous lines."""
     fig = go.Figure()
 
     if not state.window:
@@ -379,12 +352,29 @@ def build_pf_chart(state: DashboardState) -> go.Figure:
 
     times, pf_vals = _hourly_average(state.window, "power_factor_pct")
 
+    # ── Observed line (blue/teal) ──────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=times, y=pf_vals, mode="lines",
-        name="Power Factor (%)",
-        line=dict(color=TEAL, width=2),
-        hovertemplate="<b>%{x}</b><br>Power Factor: %{y:.1f}%<extra></extra>",
+        x=times, y=pf_vals, mode="lines+markers",
+        name="Observed (Actual)",
+        line=dict(color=NAVY, width=2.5),
+        marker=dict(size=5, color=NAVY),
+        hovertemplate="<b>%{x}</b><br>Observed PF: %{y:.1f}%<extra></extra>",
     ))
+
+    # ── Expected line (green) from counterfactual tensor ───────────────────────
+    tensor = state.tensor
+    if tensor and state.anomaly_time != "Unknown":
+        cf_times = _build_counterfactual_times(state.anomaly_time, len(tensor))
+        cf_pf_vals = [step[8] for step in tensor]  # FEATURE_NAMES[8] = Power Factor (%)
+
+        if cf_times:
+            fig.add_trace(go.Scatter(
+                x=cf_times, y=cf_pf_vals, mode="lines+markers",
+                name="Expected (GrCF Counterfactual)",
+                line=dict(color=GREEN, width=2.5, dash="solid"),
+                marker=dict(size=5, color=GREEN, symbol="diamond"),
+                hovertemplate="<b>%{x}</b><br>Expected PF: %{y:.1f}%<extra></extra>",
+            ))
 
     # Healthy PF zone shading (80-100%)
     fig.add_hrect(y0=80, y1=100, fillcolor="rgba(31,157,107,0.06)",
@@ -392,22 +382,15 @@ def build_pf_chart(state: DashboardState) -> go.Figure:
                   annotation_position="top left",
                   annotation_font=dict(color=GREEN, size=10))
 
-    # Counterfactual expected PF
-    tensor = state.tensor
-    if tensor:
-        cf_pf = tensor[0][8]  # FEATURE_NAMES[8] = power_factor_pct
-        fig.add_hline(y=cf_pf, line_dash="dash", line_color=GREEN, line_width=1.5,
-                      annotation_text=f"Expected: {cf_pf:.1f}%",
-                      annotation_font_color=GREEN)
-
+    # ── Anomaly marker (subtle vertical line) ─────────────────────────────────
     if state.anomaly_time != "Unknown":
         fig.add_vline(x=state.anomaly_time, line_dash="dot",
-                      line_color=RED, line_width=2.5,
+                      line_color=RED, line_width=2,
                       annotation_text="&#9650; ANOMALY",
                       annotation_font_color=RED)
 
     fig.update_layout(
-        title=dict(text="Hourly Power Factor (%) — 48-Hour Window Around Anomaly", font=dict(size=15)),
+        title=dict(text="Power Factor (%) — Observed vs Expected", font=dict(size=15)),
         xaxis=dict(title="Time (UTC)", showgrid=True, gridcolor="#e8ecf5"),
         yaxis=dict(title="Power Factor (%)", showgrid=True, gridcolor="#e8ecf5"),
         **CHART_LAYOUT,
@@ -897,11 +880,10 @@ def build_dashboard() -> gr.Blocks:
             <div class="section-badge badge-blue">INTERACTIVE CHARTS</div>
             <h2>Show Me the Data</h2>
             <p class="muted">
-                The charts below show the latest telemetry window returned by the API.
-                The <span style="color:#d64545;font-weight:700;">red dashed line</span> marks when the anomaly was detected.
-                The <span style="color:#d64545;font-weight:700;">red dot</span> shows the actual observed value.
-                The <span style="color:#1f9d6b;font-weight:700;">green diamond</span> and <span style="color:#1f9d6b;font-weight:700;">dashed line</span>
-                show the GrCF counterfactual (what <em>normal operation</em> would have looked like).
+                The charts below compare <span style="color:#1e2761;font-weight:700;">Observed (Actual)</span> readings
+                against the <span style="color:#1f9d6b;font-weight:700;">Expected (GrCF Counterfactual)</span> prediction
+                across the anomaly window. The <span style="color:#d64545;font-weight:700;">red dotted line</span> marks
+                when the anomaly was detected. Where the two lines diverge, it indicates abnormal behaviour.
             </p>
         </div>""")
 
