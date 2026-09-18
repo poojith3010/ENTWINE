@@ -6,6 +6,7 @@ returning heavily formatted pandas DataFrames ready for AI inference.
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -38,14 +39,26 @@ COLUMN_MAPPING = {
 }
 
 def get_database_engine(custom_url: Optional[str] = None) -> Engine:
-    """Create a SQLAlchemy engine, defaulting to .env credentials."""
+    """Create a SQLAlchemy engine using project-root .env credentials.
+
+    Defaults match docker-compose.yml so the engine works even if the
+    caller has not called load_dotenv previously.
+    """
     if custom_url:
         return create_engine(custom_url)
-    
-    load_dotenv()
-    url = (f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:"
-           f"{os.getenv('DB_PASSWORD', '')}@{os.getenv('DB_HOST', 'localhost')}:"
-           f"{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'entwine_db')}")
+
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
+
+    db_user     = os.getenv("DB_USER",     "entwine_admin")
+    db_password = os.getenv("DB_PASSWORD", "change_me_now")
+    db_host     = os.getenv("DB_HOST",     "localhost")
+    db_port     = os.getenv("DB_PORT",     "5432")
+    db_name     = os.getenv("DB_NAME",     "entwine_twin")
+    url = (
+        f"postgresql+psycopg2://{db_user}:{db_password}"
+        f"@{db_host}:{db_port}/{db_name}"
+    )
     return create_engine(url, pool_pre_ping=True)
 
 def get_building_state_df(meter_code: str, engine: Optional[Engine] = None) -> pd.DataFrame:

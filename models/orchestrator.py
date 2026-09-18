@@ -86,14 +86,18 @@ def save_anomaly_event(
     anomaly_time: pd.Timestamp,
     meter_code: str,
     counterfactual: np.ndarray,
-) -> None:
-    """Persist one GrCF event in a single safe database transaction."""
+) -> bool:
+    """Persist one GrCF event idempotently.
+
+    Returns True if a new row was inserted, False if one already existed
+    for this (time, meter_id) pair (ON CONFLICT DO NOTHING).
+    """
     counterfactual_json = json.dumps(counterfactual.tolist(), allow_nan=False)
     event_time: datetime = anomaly_time.to_pydatetime()
     with engine.begin() as connection:
         ensure_anomaly_events_table(connection)
         meter_id = get_meter_id(connection, meter_code)
-        connection.execute(
+        result = connection.execute(
             text(
                 """
                 INSERT INTO anomaly_events (
@@ -108,6 +112,7 @@ def save_anomaly_event(
                     :detector_type,
                     CAST(:counterfactual_data AS JSONB)
                 )
+                ON CONFLICT DO NOTHING
                 """
             ),
             {
@@ -117,6 +122,7 @@ def save_anomaly_event(
                 "counterfactual_data": counterfactual_json,
             },
         )
+        return result.rowcount > 0
 
 
 
@@ -168,18 +174,24 @@ def run_intelligence(
         )
 
         anomaly_time = pd.Timestamp(detection_df.index[anomaly_idx]).tz_convert("UTC")
-        save_anomaly_event(
+        newly_saved = save_anomaly_event(
             active_engine,
             anomaly_time,
             meter_code,
             counterfactual,
         )
-        LOGGER.info("Event Saved to Database: %s", anomaly_time.isoformat())
+        if newly_saved:
+            LOGGER.info("Event Saved to Database: %s", anomaly_time.isoformat())
+        else:
+            LOGGER.info(
+                "Event already exists for %s — skipped duplicate insert.",
+                anomaly_time.isoformat(),
+            )
         return OrchestrationResult(
             records_processed=detection_summary.records_processed,
             anomalies_detected=len(anomaly_positions),
             anomaly_time=anomaly_time,
-            event_saved=True,
+            event_saved=newly_saved,
         )
     finally:
         if owned_engine:

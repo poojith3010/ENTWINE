@@ -60,8 +60,29 @@ SESSION_FACTORY: Final[async_sessionmaker[AsyncSession]] = async_sessionmaker(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-    """Apply the additive API schema migration and dispose the engine on shutdown."""
+    """Ensure the anomaly_events table exists (with all columns) on startup.
+
+    Creates the table idempotently if it does not yet exist, then ensures
+    the natural_language_explanation column is present. This makes the API
+    safe to start before models/orchestrator.py has been executed.
+    """
     async with ENGINE.begin() as connection:
+        # Step 1: Create the table if it does not exist yet
+        await connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS anomaly_events (
+                    time                         TIMESTAMPTZ NOT NULL,
+                    meter_id                     BIGINT      NOT NULL
+                                                 REFERENCES meters(meter_id),
+                    detector_type                VARCHAR(64) NOT NULL,
+                    counterfactual_data          JSONB       NOT NULL,
+                    natural_language_explanation TEXT
+                )
+                """
+            )
+        )
+        # Step 2: Add the explanation column if a pre-existing table lacks it
         await connection.execute(
             text(
                 """
@@ -198,3 +219,156 @@ async def get_anomalies(
 async def health() -> HealthResponse:
     """Return a lightweight API availability response."""
     return HealthResponse(status="online")
+
+
+class TelemetryWindowPoint(BaseModel):
+    """One pivoted telemetry reading returned by the window endpoint."""
+    model_config = ConfigDict(from_attributes=True)
+    time: datetime
+    real_power_kw: float | None = None
+    power_factor_pct: float | None = None
+    current_avg_a: float | None = None
+    voltage_ln_avg_v: float | None = None
+    frequency_hz: float | None = None
+    apparent_power_kva: float | None = None
+
+
+@app.get(
+    "/api/v1/telemetry/{meter_code}/window",
+    response_model=list[TelemetryWindowPoint],
+    status_code=status.HTTP_200_OK,
+)
+async def get_telemetry_window(
+    meter_code: str = Path(..., min_length=1, max_length=64),
+    hours: int = 48,
+    db: AsyncSession = Depends(get_db),
+) -> list[TelemetryWindowPoint]:
+    """Return pivoted telemetry for the key dashboard parameters.
+
+    Fetches up to `hours` hours of data for the main charted parameters,
+    pivoted into wide format (one row per timestamp). Used exclusively by
+    the dashboard chart — not intended as a general-purpose endpoint.
+    """
+    query = text(
+        """
+        SELECT
+            st.time,
+            MAX(CASE WHEN st.parameter_name = 'Real Power (kW)'       THEN st.reading_value END) AS real_power_kw,
+            MAX(CASE WHEN st.parameter_name = 'Power Factor (%)'       THEN st.reading_value END) AS power_factor_pct,
+            MAX(CASE WHEN st.parameter_name = 'Current Avg (A)'        THEN st.reading_value END) AS current_avg_a,
+            MAX(CASE WHEN st.parameter_name = 'Voltage L-N Avg (V)'    THEN st.reading_value END) AS voltage_ln_avg_v,
+            MAX(CASE WHEN st.parameter_name = 'Frequency (Hz)'         THEN st.reading_value END) AS frequency_hz,
+            MAX(CASE WHEN st.parameter_name = 'Apparent Power (kVA)'   THEN st.reading_value END) AS apparent_power_kva
+        FROM state_telemetry AS st
+        JOIN meters AS m ON m.meter_id = st.meter_id
+        WHERE m.meter_code = :meter_code
+          AND st.time >= NOW() - MAKE_INTERVAL(hours => :hours)
+          AND st.parameter_name IN (
+              'Real Power (kW)', 'Power Factor (%)',
+              'Current Avg (A)', 'Voltage L-N Avg (V)',
+              'Frequency (Hz)', 'Apparent Power (kVA)'
+          )
+        GROUP BY st.time
+        ORDER BY st.time ASC
+        LIMIT 500
+        """
+    )
+    try:
+        result = await db.execute(query, {"meter_code": meter_code, "hours": hours})
+        rows = result.mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telemetry database is unavailable.",
+        ) from exc
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No windowed telemetry found for meter '{meter_code}'.",
+        )
+    return [TelemetryWindowPoint.model_validate(row) for row in rows]
+
+
+@app.get(
+    "/api/v1/telemetry/{meter_code}/anomaly-window",
+    response_model=list[TelemetryWindowPoint],
+    status_code=status.HTTP_200_OK,
+)
+async def get_anomaly_window(
+    meter_code: str = Path(..., min_length=1, max_length=64),
+    hours_before: int = 24,
+    hours_after: int = 24,
+    db: AsyncSession = Depends(get_db),
+) -> list[TelemetryWindowPoint]:
+    """Return pivoted telemetry centred around the latest anomaly event.
+
+    Fetches `hours_before` hours before and `hours_after` hours after the
+    most recent anomaly timestamp. Used by the dashboard anomaly chart.
+    """
+    anomaly_query = text(
+        """
+        SELECT ae.time
+        FROM anomaly_events ae
+        JOIN meters m ON ae.meter_id = m.meter_id
+        WHERE m.meter_code = :meter_code
+        ORDER BY ae.time DESC
+        LIMIT 1
+        """
+    )
+    try:
+        anomaly_result = await db.execute(anomaly_query, {"meter_code": meter_code})
+        anomaly_row = anomaly_result.fetchone()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Database unavailable.") from exc
+
+    if not anomaly_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"No anomaly found for meter '{meter_code}'.")
+
+    anomaly_time = anomaly_row[0]
+
+    window_query = text(
+        """
+        SELECT
+            st.time,
+            MAX(CASE WHEN st.parameter_name = 'Real Power (kW)'       THEN st.reading_value END) AS real_power_kw,
+            MAX(CASE WHEN st.parameter_name = 'Power Factor (%)'       THEN st.reading_value END) AS power_factor_pct,
+            MAX(CASE WHEN st.parameter_name = 'Current Avg (A)'        THEN st.reading_value END) AS current_avg_a,
+            MAX(CASE WHEN st.parameter_name = 'Voltage L-N Avg (V)'    THEN st.reading_value END) AS voltage_ln_avg_v,
+            MAX(CASE WHEN st.parameter_name = 'Frequency (Hz)'         THEN st.reading_value END) AS frequency_hz,
+            MAX(CASE WHEN st.parameter_name = 'Apparent Power (kVA)'   THEN st.reading_value END) AS apparent_power_kva
+        FROM state_telemetry AS st
+        JOIN meters AS m ON m.meter_id = st.meter_id
+        WHERE m.meter_code = :meter_code
+          AND st.time BETWEEN :start_time AND :end_time
+          AND st.parameter_name IN (
+              'Real Power (kW)', 'Power Factor (%)',
+              'Current Avg (A)', 'Voltage L-N Avg (V)',
+              'Frequency (Hz)', 'Apparent Power (kVA)'
+          )
+        GROUP BY st.time
+        ORDER BY st.time ASC
+        LIMIT 500
+        """
+    )
+    from datetime import timedelta
+    start_time = anomaly_time - timedelta(hours=hours_before)
+    end_time = anomaly_time + timedelta(hours=hours_after)
+
+    try:
+        result = await db.execute(window_query, {
+            "meter_code": meter_code,
+            "start_time": start_time,
+            "end_time": end_time,
+        })
+        rows = result.mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Database unavailable.") from exc
+
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="No telemetry in anomaly window.")
+
+    return [TelemetryWindowPoint.model_validate(row) for row in rows]

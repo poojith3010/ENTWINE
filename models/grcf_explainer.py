@@ -26,9 +26,10 @@ LOGGER: Final[logging.Logger] = logging.getLogger("models.grcf_explainer")
 SEED: Final[int] = 42
 SEQ_LEN: Final[int] = 16
 BATCH: Final[int] = 64
-EPOCHS_AE: Final[int] = 50
-EPOCHS_DIFF: Final[int] = 40
+EPOCHS_AE: Final[int] = 50     # kept for API compatibility (autoencoder not used in pipeline)
+EPOCHS_DIFF: Final[int] = 30   # reduced: 40→30 epochs; subsample caps training time on CPU
 LATENT_DIM: Final[int] = 32
+MAX_TRAIN_SEQS: Final[int] = 1_500  # cap denoiser training set for CPU performance
 DIFF_STEPS: Final[int] = 100
 LEARNING_RATE: Final[float] = 1e-3
 CF_ITER: Final[int] = 150
@@ -436,11 +437,30 @@ def _fit_autoencoder(normal_sequences: np.ndarray) -> LSTMAutoEncoder:
 
 
 def _fit_denoiser(normal_sequences: np.ndarray) -> LSTMDenoiser:
-    """Train the mentor DDPM denoiser only on normal sequences."""
+    """Train the DDPM denoiser on a representative subset of normal sequences.
+
+    Training is capped at MAX_TRAIN_SEQS sequences drawn without replacement so
+    that denoiser fitting runs in ~10-15 seconds on CPU regardless of how many
+    normal windows exist in the full dataset.
+    """
     model = LSTMDenoiser(normal_sequences.shape[2]).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
-    tensor = torch.as_tensor(normal_sequences, dtype=torch.float32, device=DEVICE)
+
+    # Subsample for CPU performance while preserving statistical representativeness
+    rng = np.random.default_rng(SEED)
+    n_seqs = len(normal_sequences)
+    if n_seqs > MAX_TRAIN_SEQS:
+        indices = rng.choice(n_seqs, size=MAX_TRAIN_SEQS, replace=False)
+        train_seqs = normal_sequences[indices]
+        LOGGER.info(
+            "Denoiser training: subsampled %d / %d normal sequences.",
+            MAX_TRAIN_SEQS, n_seqs,
+        )
+    else:
+        train_seqs = normal_sequences
+
+    tensor = torch.as_tensor(train_seqs, dtype=torch.float32, device=DEVICE)
     model.train()
     for _ in range(EPOCHS_DIFF):
         timestep = torch.randint(
@@ -498,7 +518,10 @@ def explain_anomaly(
     scaled_normal = scaled_sequences[sequence_normal_mask]
 
     _seed_torch()
-    _fit_autoencoder(scaled_normal)
+    # NOTE: The LSTM autoencoder is not used in the production GrCF counterfactual
+    # generation path — only the DDPM denoiser is needed for the warm-start.
+    # _fit_autoencoder is intentionally skipped here to avoid ~4 minutes of CPU
+    # training for a tensor that is immediately discarded.
     denoiser = _fit_denoiser(scaled_normal)
     causal_columns = [column for column in CAUSAL_COLUMNS if column in frame.columns]
     causal_matrix = granger_causal_graph(frame, causal_columns)

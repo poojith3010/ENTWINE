@@ -17,7 +17,7 @@ xgboost==3.4.1          # Contextual real-power regression
 scikit-learn==1.9.1     # Isolation Forest anomaly detection and scaling
 scipy==1.18.1           # Granger F-test statistics
 torch==2.14.0           # LSTM autoencoder and DDPM denoiser
-transformers==4.57.1   # Optional local deterministic GridReason generation
+transformers>=4.57.1   # Optional local deterministic GridReason generation
 networkx==3.6.1         # Granger causal graph utilities
 optuna==5.0.0           # Optional research-model hyperparameter tuning
 
@@ -30,3 +30,4 @@ gradio==6.27.0         # Interactive Phase 2 dashboard
 
 # ── Development and validation ───────────────────────────────────────────────
 pytest==9.1.1           # Automated test runner
+plotly>=5.0
