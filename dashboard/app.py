@@ -81,10 +81,19 @@ class WindowPoint(TypedDict, total=False):
     apparent_power_kva: float | None
 
 
+class MonthlyPoint(TypedDict, total=False):
+    """Shape of a monthly telemetry summary returned by FastAPI."""
+
+    month: str
+    average_real_power_kw: float | None
+    average_power_factor_pct: float | None
+
+
 @dataclass
 class DashboardState:
     event: AnomalyPayload | None = None
     window: list[WindowPoint] = field(default_factory=list)
+    monthly: list[MonthlyPoint] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -120,13 +129,22 @@ def fetch_state() -> DashboardState:
 
             window_resp = client.get(
                 f"{API_BASE}/api/v1/telemetry/{METER}/anomaly-window",
-                params={"hours_before": 24, "hours_after": 12},
+                params={"hours_before": 24, "hours_after": 24},
             )
             window_data: list[WindowPoint] = []
             if window_resp.status_code == 200:
                 window_data = window_resp.json()
+            monthly_resp = client.get(
+                f"{API_BASE}/api/v1/telemetry/{METER}/monthly",
+                params={"months": 24},
+            )
+            monthly_data: list[MonthlyPoint] = []
+            if monthly_resp.status_code == 200:
+                monthly_data = monthly_resp.json()
 
-        return DashboardState(event=anomalies[0], window=window_data)
+        return DashboardState(
+            event=anomalies[0], window=window_data, monthly=monthly_data
+        )
 
     except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return DashboardState(error=f"Backend request failed: {type(exc).__name__}: {exc}")
@@ -173,6 +191,21 @@ def _fmt_pct(val: float) -> str:
     return f"{sign}{val:.1f}%"
 
 
+def _hourly_average(
+    window: list[WindowPoint], value_key: str
+) -> tuple[list[str], list[float]]:
+    """Aggregate live telemetry values into UTC hourly averages."""
+    buckets: dict[str, list[float]] = {}
+    for point in window:
+        timestamp = point.get("time")
+        value = point.get(value_key)  # type: ignore[literal-required]
+        if timestamp and value is not None:
+            hour = timestamp[:13] + ":00:00Z"
+            buckets.setdefault(hour, []).append(float(value))
+    times = sorted(buckets)
+    return times, [sum(buckets[time]) / len(buckets[time]) for time in times]
+
+
 # ── Chart builders ─────────────────────────────────────────────────────────────
 
 CHART_LAYOUT = dict(
@@ -199,8 +232,7 @@ def build_power_chart(state: DashboardState) -> go.Figure:
         )
         return fig
 
-    times = [p["time"] for p in state.window]
-    powers = [p.get("real_power_kw") for p in state.window]
+    times, powers = _hourly_average(state.window, "real_power_kw")
 
     # ── Historical line ────────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
@@ -281,9 +313,57 @@ def build_power_chart(state: DashboardState) -> go.Figure:
             ))
 
     fig.update_layout(
-        title=dict(text="Real Power (kW) — 36-Hour Window Around Anomaly", font=dict(size=15)),
+        title=dict(text="Hourly Real Power (kW) — 48-Hour Window Around Anomaly", font=dict(size=15)),
         xaxis=dict(title="Time (UTC)", showgrid=True, gridcolor="#e8ecf5"),
         yaxis=dict(title="Real Power (kW)", showgrid=True, gridcolor="#e8ecf5", rangemode="tozero"),
+        **CHART_LAYOUT,
+    )
+    return fig
+
+
+def build_monthly_power_chart(state: DashboardState) -> go.Figure:
+    """Build a monthly average real-power chart from live telemetry."""
+    fig = go.Figure()
+    if not state.monthly:
+        fig.update_layout(
+            title="Monthly Real Power (kW) — No telemetry data",
+            annotations=[dict(text="No monthly telemetry data available", x=0.5, y=0.5,
+                              xref="paper", yref="paper", showarrow=False,
+                              font=dict(size=16, color=SLATE))],
+            **CHART_LAYOUT,
+        )
+        return fig
+
+    monthly = [
+        point for point in state.monthly
+        if point.get("average_real_power_kw") is not None
+        or point.get("average_power_factor_pct") is not None
+    ]
+    months = [point.get("month", "") for point in monthly]
+    power = [point.get("average_real_power_kw") for point in monthly]
+    pf = [point.get("average_power_factor_pct") for point in monthly]
+    fig.add_trace(go.Bar(
+        x=months,
+        y=power,
+        name="Monthly Average Real Power",
+        marker_color=NAVY,
+        opacity=0.9,
+        hovertemplate="<b>%{x}</b><br>Average: %{y:.2f} kW<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=months,
+        y=pf,
+        name="Monthly Average Power Factor",
+        mode="lines+markers",
+        line=dict(color=TEAL, width=2),
+        yaxis="y2",
+        hovertemplate="<b>%{x}</b><br>Power factor: %{y:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="Monthly Live Energy Profile", font=dict(size=15)),
+        xaxis=dict(title="Month (UTC)", showgrid=False),
+        yaxis=dict(title="Average Real Power (kW)", showgrid=True, gridcolor="#e8ecf5"),
+        yaxis2=dict(title="Average Power Factor (%)", overlaying="y", side="right", range=[0, 105]),
         **CHART_LAYOUT,
     )
     return fig
@@ -297,8 +377,7 @@ def build_pf_chart(state: DashboardState) -> go.Figure:
         fig.update_layout(title="Power Factor (%) — No data", **CHART_LAYOUT)
         return fig
 
-    times = [p["time"] for p in state.window]
-    pf_vals = [p.get("power_factor_pct") for p in state.window]
+    times, pf_vals = _hourly_average(state.window, "power_factor_pct")
 
     fig.add_trace(go.Scatter(
         x=times, y=pf_vals, mode="lines",
@@ -328,7 +407,7 @@ def build_pf_chart(state: DashboardState) -> go.Figure:
                       annotation_font_color=RED)
 
     fig.update_layout(
-        title=dict(text="Power Factor (%) — 36-Hour Window Around Anomaly", font=dict(size=15)),
+        title=dict(text="Hourly Power Factor (%) — 48-Hour Window Around Anomaly", font=dict(size=15)),
         xaxis=dict(title="Time (UTC)", showgrid=True, gridcolor="#e8ecf5"),
         yaxis=dict(title="Power Factor (%)", showgrid=True, gridcolor="#e8ecf5"),
         **CHART_LAYOUT,
@@ -694,11 +773,14 @@ body, .gradio-container { font-family:'Inter',sans-serif !important; background:
 .pipe-num-green { color:var(--green) !important; opacity:1; }
 .pipe-num-teal { color:var(--teal) !important; opacity:1; }
 .pipe-title { font-size:14px; font-weight:700; color:var(--navy) !important; margin-bottom:8px; }
-.pipe-desc { font-size:12.5px; color:#3a4260 !important; line-height:1.75; }
+.pipe-desc { font-size:12.5px; color:#1e2761 !important; line-height:1.75; }
+.pipe-desc strong { color:var(--teal) !important; font-weight:800; }
+.pipe-desc em { color:#9a6500 !important; font-style:normal; font-weight:700; }
+.pipe-desc li strong { color:var(--green) !important; }
 .pipe-desc ul { margin:8px 0 0 16px; padding:0; }
 .pipe-desc li { margin-bottom:4px; }
 .pipe-tech { margin-top:10px; font-size:10px; font-weight:700; letter-spacing:.8px;
-    color:var(--slate) !important; background:var(--panel); border:1px solid var(--border);
+    color:var(--teal) !important; background:var(--teal-soft); border:1px solid rgba(14,142,142,.3);
     border-radius:3px; padding:3px 8px; display:inline-block; }
 .pipe-body { flex:1; }
 
@@ -735,7 +817,7 @@ footer { display:none !important; }
 
 # ── Main refresh function ─────────────────────────────────────────────────────
 
-def refresh_all():
+def refresh_all() -> tuple[str, str, str, go.Figure, go.Figure, go.Figure, go.Figure, str, list[list[float]]]:
     """Fetch all data and return values for every dashboard component."""
     state = fetch_state()
     return (
@@ -745,9 +827,15 @@ def refresh_all():
         build_power_chart(state),
         build_pf_chart(state),
         build_comparison_chart(state),
+        build_monthly_power_chart(state),
         build_comparison_table(state),
         build_tensor_viewer(state),
     )
+
+
+def refresh_dashboard() -> tuple[str, str, str, go.Figure, go.Figure, go.Figure, go.Figure, str, list[list[float]]]:
+    """Compatibility alias for callers that refresh the dashboard directly."""
+    return refresh_all()
 
 
 # ── Dashboard layout ──────────────────────────────────────────────────────────
@@ -763,6 +851,7 @@ def build_dashboard() -> gr.Blocks:
     init_power = build_power_chart(state)
     init_pf = build_pf_chart(state)
     init_comp = build_comparison_chart(state)
+    init_monthly = build_monthly_power_chart(state)
     init_table = build_comparison_table(state)
     init_tensor = build_tensor_viewer(state)
 
@@ -778,7 +867,7 @@ def build_dashboard() -> gr.Blocks:
                     <p>Operator console &middot; CAFA anomaly detection &middot; GrCF counterfactual explanation &middot; GridReason alerts &middot; PH-A-MAIN</p>
                 </div>
                 <div style="text-align:right">
-                    <div style="color:#b9c2e0;font-size:11px;">Powerhouse 1 &middot; Kongu Engineering College</div>
+                    <div style="color:#b9c2e0;font-size:11px;">Powerhouse 1 &middot; Kumaraguru College of Technology</div>
                     <div style="color:var(--amber);font-size:12px;font-weight:700;">Module 3 &middot; Intelligence Dashboard</div>
                 </div>
             </div>
@@ -789,7 +878,7 @@ def build_dashboard() -> gr.Blocks:
 
         # ── Refresh button ────────────────────────────────────────────────────
         with gr.Row():
-            refresh_btn = gr.Button("&#8635; Refresh Data", elem_classes=["refresh-btn"])
+            refresh_btn = gr.Button("Refresh Data", elem_classes=["refresh-btn"])
             gr.Markdown(
                 "_Dashboard auto-loads from FastAPI backend. "
                 "Click Refresh to re-poll for the latest anomaly event._",
@@ -808,7 +897,7 @@ def build_dashboard() -> gr.Blocks:
             <div class="section-badge badge-blue">INTERACTIVE CHARTS</div>
             <h2>Show Me the Data</h2>
             <p class="muted">
-                The charts below show 36 hours of telemetry centred on the anomaly timestamp.
+                The charts below show the latest telemetry window returned by the API.
                 The <span style="color:#d64545;font-weight:700;">red dashed line</span> marks when the anomaly was detected.
                 The <span style="color:#d64545;font-weight:700;">red dot</span> shows the actual observed value.
                 The <span style="color:#1f9d6b;font-weight:700;">green diamond</span> and <span style="color:#1f9d6b;font-weight:700;">dashed line</span>
@@ -822,6 +911,8 @@ def build_dashboard() -> gr.Blocks:
             pf_chart = gr.Plot(value=init_pf, label="")
         with gr.Row():
             comp_chart = gr.Plot(value=init_comp, label="")
+        with gr.Row():
+            monthly_chart = gr.Plot(value=init_monthly, label="")
 
         # ── Section 4: Observed vs Counterfactual Table ───────────────────────
         table_html = gr.HTML(value=init_table)
@@ -845,7 +936,7 @@ def build_dashboard() -> gr.Blocks:
 
         # ── Wire up Refresh ───────────────────────────────────────────────────
         outputs = [kpis, alert_html, method_html, power_chart, pf_chart,
-                   comp_chart, table_html, tensor_df]
+               comp_chart, monthly_chart, table_html, tensor_df]
 
         dashboard.load(fn=refresh_all, inputs=[], outputs=outputs)
         refresh_btn.click(fn=refresh_all, inputs=[], outputs=outputs)

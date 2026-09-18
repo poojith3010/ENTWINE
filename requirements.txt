@@ -27,6 +27,7 @@ uvicorn==0.35.0        # ASGI development/production server
 asyncpg==0.31.0        # Async PostgreSQL driver for SQLAlchemy
 httpx==0.28.1          # FastAPI endpoint testing client
 gradio==6.27.0         # Interactive Phase 2 dashboard
+plotly==7.1.0          # Interactive telemetry and counterfactual charts
 
 # ── Development and validation ───────────────────────────────────────────────
 pytest==9.1.1           # Automated test runner

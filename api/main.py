@@ -233,6 +233,16 @@ class TelemetryWindowPoint(BaseModel):
     apparent_power_kva: float | None = None
 
 
+class MonthlyTelemetryPoint(BaseModel):
+    """One live monthly energy summary for dashboard trend charts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    month: datetime
+    average_real_power_kw: float | None = None
+    average_power_factor_pct: float | None = None
+
+
 @app.get(
     "/api/v1/telemetry/{meter_code}/window",
     response_model=list[TelemetryWindowPoint],
@@ -287,6 +297,55 @@ async def get_telemetry_window(
             detail=f"No windowed telemetry found for meter '{meter_code}'.",
         )
     return [TelemetryWindowPoint.model_validate(row) for row in rows]
+
+
+@app.get(
+    "/api/v1/telemetry/{meter_code}/monthly",
+    response_model=list[MonthlyTelemetryPoint],
+    status_code=status.HTTP_200_OK,
+)
+async def get_monthly_telemetry(
+    meter_code: str = Path(..., min_length=1, max_length=64),
+    months: int = 24,
+    db: AsyncSession = Depends(get_db),
+) -> list[MonthlyTelemetryPoint]:
+    """Return monthly averages computed from live state telemetry."""
+    if months < 1 or months > 120:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="months must be between 1 and 120.",
+        )
+    query = text(
+        """
+        SELECT
+            date_trunc('month', st.time AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS month,
+            AVG(CASE WHEN st.parameter_name = 'Real Power (kW)' THEN st.reading_value END)
+                AS average_real_power_kw,
+            AVG(CASE WHEN st.parameter_name = 'Power Factor (%)' THEN st.reading_value END)
+                AS average_power_factor_pct
+        FROM state_telemetry AS st
+        JOIN meters AS m ON m.meter_id = st.meter_id
+        WHERE m.meter_code = :meter_code
+          AND st.time >= NOW() - MAKE_INTERVAL(months => :months)
+          AND st.parameter_name IN ('Real Power (kW)', 'Power Factor (%)')
+        GROUP BY date_trunc('month', st.time AT TIME ZONE 'UTC')
+        ORDER BY month ASC
+        """
+    )
+    try:
+        result = await db.execute(query, {"meter_code": meter_code, "months": months})
+        rows = result.mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telemetry database is unavailable.",
+        ) from exc
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No monthly telemetry found for meter '{meter_code}'.",
+        )
+    return [MonthlyTelemetryPoint.model_validate(row) for row in rows]
 
 
 @app.get(
