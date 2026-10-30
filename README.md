@@ -163,3 +163,34 @@ ENTWINE/
 ```powershell
 docker compose down          # stops container, preserves volume data
 ```
+
+---
+
+## 9. Validating CAFA and GrCF with Simulated Live Data
+
+The repository includes an isolated validation experiment that creates a
+fresh 15-minute meter stream, injects one known high-load/low-power-factor
+event in the final holdout period, and passes the stream to the existing CAFA
+and GrCF implementations without modifying them.
+
+Run it from the project root:
+
+```powershell
+$env:PYTHONUTF8 = 1
+.\.venv\Scripts\python.exe -m validation.live_meter_simulation
+```
+
+The report shows:
+
+- how many injected event intervals CAFA detected;
+- false positives outside the injected event;
+- GrCF's 16-by-10 counterfactual output;
+- observed event values compared with the counterfactual values.
+
+The simulator uses the same 15-minute cadence as the historical meter data.
+CAFA's existing lag and rolling constants are intentionally unchanged and
+remain row-based.
+
+The dashboard also contains a **Test With Simulated Live Meter Data** section.
+It runs this experiment only when its button is clicked, so the existing
+database-backed dashboard view is not replaced.

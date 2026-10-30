@@ -20,6 +20,14 @@ import httpx
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from validation.live_meter_simulation import (
+    build_validation_figure,
+    format_validation_report,
+    run_live_validation,
+    simulate_live_meter,
+    validation_table,
+)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 API_BASE: Final[str] = "http://127.0.0.1:8000"
@@ -804,6 +812,22 @@ body, .gradio-container { font-family:'Inter',sans-serif !important; background:
 
 /* Misc */
 .muted { color:var(--slate) !important; font-size:13px; line-height:1.6; }
+.simulation-report {
+    background:#ffffff !important;
+    border:1px solid var(--border);
+    border-left:4px solid var(--amber);
+    border-radius:8px;
+    padding:18px 22px !important;
+    margin:12px 0 18px !important;
+    color:var(--navy) !important;
+    font-size:14px !important;
+    line-height:1.65 !important;
+}
+.simulation-report h2,
+.simulation-report h3,
+.simulation-report strong { color:var(--navy) !important; }
+.simulation-report p,
+.simulation-report li { color:var(--navy) !important; }
 .gradio-container code { background:var(--alt) !important; border:1px solid var(--border) !important;
     border-radius:3px; padding:1px 5px; font-family:monospace; color:var(--navy) !important; }
 .refresh-btn { background:var(--navy) !important; color:#fff !important;
@@ -836,6 +860,17 @@ def refresh_all() -> tuple[str, str, str, go.Figure, go.Figure, go.Figure, go.Fi
 def refresh_dashboard() -> tuple[str, str, str, go.Figure, go.Figure, go.Figure, go.Figure, str, list[list[float]]]:
     """Compatibility alias for callers that refresh the dashboard directly."""
     return refresh_all()
+
+
+def run_simulation_for_dashboard() -> tuple[str, go.Figure, list[list[str | float]]]:
+    """Run the isolated live-meter validation for the dashboard."""
+    telemetry, simulation = simulate_live_meter()
+    result = run_live_validation(telemetry, simulation)
+    return (
+        format_validation_report(result),
+        build_validation_figure(result),
+        validation_table(result),
+    )
 
 
 # ── Dashboard layout ──────────────────────────────────────────────────────────
@@ -934,12 +969,47 @@ def build_dashboard() -> gr.Blocks:
                 interactive=False,
             )
 
+        # ── Section 6: Isolated simulated live-meter validation ───────────────
+        gr.HTML("""
+        <div class="section-card">
+            <div class="section-badge badge-amber">MODEL VALIDATION</div>
+            <h2>Test With Simulated Live Meter Data</h2>
+            <p class="muted">
+                This experiment does not use the database or historical anomaly event.
+                It creates a fresh <strong>15-minute meter stream</strong>, injects one known
+                high-load/low-power-factor event, and feeds that stream into the existing CAFA
+                and GrCF algorithms unchanged. Red X markers show CAFA flags; the shaded region
+                is the known injected event; the green dashed line is GrCF's alternative.
+                The report explains the measured residual and feature changes in plain English.
+            </p>
+        </div>""")
+        simulate_btn = gr.Button(
+            "Run New Live-Meter Validation",
+            elem_classes=["refresh-btn"],
+        )
+        simulation_report = gr.Markdown(
+            "Click the button to generate simulated meter data and run CAFA + GrCF.",
+            elem_classes=["simulation-report"],
+        )
+        simulation_chart = gr.Plot(label="Simulation validation")
+        simulation_table = gr.Dataframe(
+            headers=["Feature", "Observed injected event", "GrCF alternative"],
+            datatype=["str", "number", "number"],
+            interactive=False,
+            label="Observed vs GrCF alternative",
+        )
+
         # ── Wire up Refresh ───────────────────────────────────────────────────
         outputs = [kpis, alert_html, method_html, power_chart, pf_chart,
                comp_chart, monthly_chart, table_html, tensor_df]
 
         dashboard.load(fn=refresh_all, inputs=[], outputs=outputs)
         refresh_btn.click(fn=refresh_all, inputs=[], outputs=outputs)
+        simulate_btn.click(
+            fn=run_simulation_for_dashboard,
+            inputs=[],
+            outputs=[simulation_report, simulation_chart, simulation_table],
+        )
 
     return dashboard
 
