@@ -27,6 +27,16 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from validation.live_meter_service import (
+    LiveMeterSimulator,
+    SimulatedReading,
+    SimulatedReadingStore,
+    SimulationConfig,
+)
+from validation.sim_pipeline import (
+    run_full_sim_pipeline,
+)
+
 PROJECT_ROOT: Final[str] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
@@ -56,6 +66,8 @@ SESSION_FACTORY: Final[async_sessionmaker[AsyncSession]] = async_sessionmaker(
     ENGINE,
     expire_on_commit=False,
 )
+SIMULATED_STORE: Final[SimulatedReadingStore] = SimulatedReadingStore()
+LIVE_SIMULATOR: LiveMeterSimulator | None = None
 
 
 @asynccontextmanager
@@ -120,6 +132,45 @@ class HealthResponse(BaseModel):
     """Service health response."""
 
     status: str = Field(pattern="^online$")
+
+
+class SimulatorStartRequest(BaseModel):
+    """Validated configuration for starting a simulated meter session."""
+
+    simulation_id: str = Field(default="demo-ph-a", min_length=1, max_length=100)
+    duration_minutes: int = Field(default=15, ge=1, le=1440)
+    interval_seconds: float = Field(default=60.0, gt=0, le=3600)
+    abnormal_start_minute: int = Field(default=5, ge=0)
+    abnormal_duration_minutes: int = Field(default=4, ge=1)
+    abnormal_multiplier: float = Field(default=1.6, gt=1.0, le=10.0)
+    random_seed: int = Field(default=20261030)
+
+
+class SimulatorStatusResponse(BaseModel):
+    """Current simulated-meter lifecycle and processing counters."""
+
+    status: str
+    meter_code: str
+    simulation_id: str
+    generated: int
+    persisted: int
+    failed: int
+    injected_anomalies: int
+    latest_reading: SimulatedReading | None = None
+    error: str | None = None
+
+
+class SimulatedTelemetryRecord(BaseModel):
+    """One persisted synthetic meter observation."""
+
+    time: datetime
+    meter_code: str
+    simulation_id: str
+    real_power_kw: float
+    current_avg_a: float
+    power_factor_pct: float
+    known_anomaly: bool
+    simulation_status: str
 
 
 app = FastAPI(
@@ -219,6 +270,103 @@ async def get_anomalies(
 async def health() -> HealthResponse:
     """Return a lightweight API availability response."""
     return HealthResponse(status="online")
+
+
+def _simulator_status() -> SimulatorStatusResponse:
+    """Convert the active simulator state into an API response."""
+    simulator = LIVE_SIMULATOR
+    if simulator is None:
+        return SimulatorStatusResponse(
+            status="stopped",
+            meter_code="PH-A-MAIN",
+            simulation_id="",
+            generated=0,
+            persisted=0,
+            failed=0,
+            injected_anomalies=0,
+        )
+    stats = simulator.stats
+    return SimulatorStatusResponse(
+        status=stats.status,
+        meter_code=simulator.config.meter_code,
+        simulation_id=simulator.config.simulation_id,
+        generated=stats.generated,
+        persisted=stats.persisted,
+        failed=stats.failed,
+        injected_anomalies=stats.injected_anomalies,
+        latest_reading=stats.last_reading,
+        error=stats.error,
+    )
+
+
+@app.post("/api/v1/simulator/start", response_model=SimulatorStatusResponse)
+async def start_simulator(request: SimulatorStartRequest) -> SimulatorStatusResponse:
+    """Start one controlled simulated PH-A-MAIN meter session."""
+    global LIVE_SIMULATOR
+    if LIVE_SIMULATOR is not None and LIVE_SIMULATOR.stats.status == "running":
+        raise HTTPException(status_code=409, detail="Simulator is already running.")
+    config = SimulationConfig(
+        meter_code="PH-A-MAIN",
+        simulation_id=request.simulation_id,
+        duration_minutes=request.duration_minutes,
+        interval_seconds=request.interval_seconds,
+        abnormal_start_minute=request.abnormal_start_minute,
+        abnormal_duration_minutes=request.abnormal_duration_minutes,
+        abnormal_multiplier=request.abnormal_multiplier,
+        random_seed=request.random_seed,
+    )
+    try:
+        SIMULATED_STORE.ensure_table()
+        LIVE_SIMULATOR = LiveMeterSimulator(config, SIMULATED_STORE.persist)
+        LIVE_SIMULATOR.start()
+    except (ValueError, SQLAlchemyError, OSError) as exc:
+        LIVE_SIMULATOR = None
+        raise HTTPException(status_code=503, detail=f"Simulator could not start: {exc}") from exc
+    return _simulator_status()
+
+
+@app.post("/api/v1/simulator/stop", response_model=SimulatorStatusResponse)
+async def stop_simulator() -> SimulatorStatusResponse:
+    """Stop the active simulated meter session without deleting its records."""
+    if LIVE_SIMULATOR is not None:
+        LIVE_SIMULATOR.stop()
+    return _simulator_status()
+
+
+@app.get("/api/v1/simulator/status", response_model=SimulatorStatusResponse)
+async def simulator_status() -> SimulatorStatusResponse:
+    """Return current simulator status, counters, and latest reading."""
+    return _simulator_status()
+
+
+@app.get(
+    "/api/v1/simulator/readings",
+    response_model=list[SimulatedTelemetryRecord],
+)
+async def simulated_readings(
+    simulation_id: str | None = None,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+) -> list[SimulatedTelemetryRecord]:
+    """Return persisted synthetic readings, newest first."""
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 1000.")
+    query = text("""
+        SELECT st.time, m.meter_code, st.simulation_id,
+               st.real_power_kw, st.current_avg_a, st.power_factor_pct,
+               st.known_anomaly, st.simulation_status
+        FROM simulated_telemetry st
+        JOIN meters m ON m.meter_id = st.meter_id
+        WHERE (:simulation_id IS NULL OR st.simulation_id = :simulation_id)
+        ORDER BY st.time DESC
+        LIMIT :limit
+    """)
+    try:
+        result = await db.execute(query, {"simulation_id": simulation_id, "limit": limit})
+        rows = result.mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Simulator database is unavailable.") from exc
+    return [SimulatedTelemetryRecord.model_validate(row) for row in rows]
 
 
 class TelemetryWindowPoint(BaseModel):
@@ -431,3 +579,184 @@ async def get_anomaly_window(
                             detail="No telemetry in anomaly window.")
 
     return [TelemetryWindowPoint.model_validate(row) for row in rows]
+
+
+# == Simulation Pipeline Endpoints =============================================
+
+import asyncio
+import math
+
+
+def _nan_to_none(v):
+    """Convert NaN/inf to None for JSON serialisation."""
+    if v is None:
+        return None
+    try:
+        if math.isnan(v) or math.isinf(v):
+            return None
+    except TypeError:
+        return None
+    return v
+
+
+class FeatureChangeRecord(BaseModel):
+    """One feature change from observed to counterfactual."""
+    feature: str
+    delta: float
+
+
+class GrCFSummary(BaseModel):
+    """GrCF result summary for the dashboard."""
+    status: str
+    anomaly_idx: int = -1
+    anomaly_time: datetime | None = None
+    counterfactual_shape: list[int] = []
+    feature_changes: list[FeatureChangeRecord] = []
+    error: str | None = None
+    elapsed_s: float = 0.0
+
+
+class CafaSummary(BaseModel):
+    """CAFA run summary for the dashboard."""
+    status: str
+    records_processed: int = 0
+    anomalies_flagged: int = 0
+    mae_kw: float = 0.0
+    error: str | None = None
+    elapsed_s: float = 0.0
+
+
+class AuditSummary(BaseModel):
+    """CAFA audit summary for the dashboard."""
+    status: str
+    n_evaluated: int = 0
+    n_true_positive: int = 0
+    n_false_positive: int = 0
+    n_false_negative: int = 0
+    n_true_negative: int = 0
+    recall: float | None = None
+    precision: float | None = None
+    f1: float | None = None
+    n_known_anomaly: int = 0
+    n_cafa_flagged: int = 0
+    warnings: list[str] = []
+    note: str = ""
+
+
+class GridReasonSummary(BaseModel):
+    """GridReason alert summary for the dashboard."""
+    status: str
+    alert: str | None = None
+
+
+class SimPipelineResponse(BaseModel):
+    """Full simulation pipeline result for dashboard consumption."""
+    pipeline_status: str
+    adapter_status: str
+    adapter_n_1min_rows: int = 0
+    adapter_n_15min_rows: int = 0
+    adapter_warnings: list[str] = []
+    cafa: CafaSummary
+    grcf: GrCFSummary
+    gridreason: GridReasonSummary
+    audit: AuditSummary
+    summary: str = ""
+    pipeline_elapsed_s: float = 0.0
+
+
+@app.post(
+    "/api/v1/simulator/pipeline",
+    response_model=SimPipelineResponse,
+    status_code=200,
+)
+async def run_simulation_pipeline(
+    simulation_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> SimPipelineResponse:
+    """Run the full simulation to CAFA to GrCF to GridReason to Audit pipeline."""
+    from validation.sim_pipeline import (
+        CafaRunResult,
+        GrCFRunResult,
+        CafaAuditResult,
+        run_full_sim_pipeline,
+    )
+    import pandas as pd
+
+    df_1min = None
+    if simulation_id:
+        try:
+            q = text(
+                "SELECT st.time, st.real_power_kw, st.current_avg_a, "
+                "st.voltage_ln_avg_v, st.voltage_ll_avg_v, st.frequency_hz, "
+                "st.power_factor_pct, st.apparent_power_kva, st.known_anomaly "
+                "FROM simulated_telemetry st "
+                "JOIN meters m ON m.meter_id = st.meter_id "
+                "WHERE st.simulation_id = :sid ORDER BY st.time ASC"
+            )
+            res = await db.execute(q, {"sid": simulation_id})
+            rows = res.mappings().all()
+            if rows:
+                recs = [dict(r) for r in rows]
+                df_1min = pd.DataFrame(recs)
+                df_1min["time"] = pd.to_datetime(df_1min["time"], utc=True)
+                df_1min = df_1min.set_index("time")
+        except Exception:
+            df_1min = None
+
+    loop = asyncio.get_event_loop()
+    pipeline_result = await loop.run_in_executor(None, run_full_sim_pipeline, df_1min)
+
+    adapter = pipeline_result.adapter
+    cafa = pipeline_result.cafa or CafaRunResult(status="skipped")
+    grcf = pipeline_result.grcf or GrCFRunResult(status="skipped")
+    gr = pipeline_result.gridreason
+    audit = pipeline_result.audit or CafaAuditResult(status="skipped")
+
+    return SimPipelineResponse(
+        pipeline_status="ok" if cafa.status == "ok" else cafa.status,
+        adapter_status=adapter.status if adapter else "skipped",
+        adapter_n_1min_rows=adapter.n_1min_rows if adapter else 0,
+        adapter_n_15min_rows=adapter.n_15min_rows if adapter else 0,
+        adapter_warnings=adapter.warnings if adapter else [],
+        cafa=CafaSummary(
+            status=cafa.status,
+            records_processed=cafa.records_processed,
+            anomalies_flagged=cafa.anomalies_flagged,
+            mae_kw=_nan_to_none(cafa.mae_kw) or 0.0,
+            error=cafa.error,
+            elapsed_s=cafa.elapsed_s,
+        ),
+        grcf=GrCFSummary(
+            status=grcf.status,
+            anomaly_idx=grcf.anomaly_idx,
+            anomaly_time=grcf.anomaly_time.to_pydatetime() if grcf.anomaly_time else None,
+            counterfactual_shape=list(grcf.counterfactual.shape) if grcf.counterfactual is not None else [],
+            feature_changes=[
+                FeatureChangeRecord(feature=k, delta=v)
+                for k, v in (grcf.feature_changes or {}).items()
+            ],
+            error=grcf.error,
+            elapsed_s=grcf.elapsed_s,
+        ),
+        gridreason=GridReasonSummary(
+            status=gr.status if gr else "skipped",
+            alert=gr.alert if gr else None,
+        ),
+        audit=AuditSummary(
+            status=audit.status,
+            n_evaluated=audit.n_evaluated,
+            n_true_positive=audit.n_true_positive,
+            n_false_positive=audit.n_false_positive,
+            n_false_negative=audit.n_false_negative,
+            n_true_negative=audit.n_true_negative,
+            recall=_nan_to_none(audit.recall),
+            precision=_nan_to_none(audit.precision),
+            f1=_nan_to_none(audit.f1),
+            n_known_anomaly=audit.n_known_anomaly,
+            n_cafa_flagged=audit.n_cafa_flagged,
+            warnings=audit.warnings,
+            note=audit.note,
+        ),
+        summary=pipeline_result.summary,
+        pipeline_elapsed_s=pipeline_result.pipeline_elapsed_s,
+    )

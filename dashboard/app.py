@@ -10,16 +10,23 @@ to a technical audience. It answers three core questions:
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Final, TypedDict
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import gradio as gr
 import httpx
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from validation.sim_pipeline import run_full_sim_pipeline
 from validation.live_meter_simulation import (
     build_validation_figure,
     format_validation_report,
@@ -156,6 +163,57 @@ def fetch_state() -> DashboardState:
 
     except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return DashboardState(error=f"Backend request failed: {type(exc).__name__}: {exc}")
+
+
+def simulator_status_text() -> str:
+    """Fetch and format simulator lifecycle counters for the dashboard."""
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.get(f"{API_BASE}/api/v1/simulator/status")
+            response.raise_for_status()
+        data = response.json()
+        latest = data.get("latest_reading") or {}
+        return (
+            f"**Simulator:** `{data.get('status', 'unknown')}`  |  "
+            f"**Meter:** `{data.get('meter_code', 'PH-A-MAIN')}`  |  "
+            f"**Generated:** `{data.get('generated', 0)}`  |  "
+            f"**Injected abnormal:** `{data.get('injected_anomalies', 0)}`  |  "
+            f"**Latest:** `{latest.get('time', 'none')}`"
+        )
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"**Simulator unavailable:** `{type(exc).__name__}`"
+
+
+def start_simulator_dashboard() -> str:
+    """Start the default accelerated simulator demonstration."""
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(
+                f"{API_BASE}/api/v1/simulator/start",
+                json={
+                    "simulation_id": "dashboard-demo",
+                    "duration_minutes": 15,
+                    "interval_seconds": 1.0,
+                    "abnormal_start_minute": 5,
+                    "abnormal_duration_minutes": 4,
+                    "random_seed": 20261030,
+                },
+            )
+            response.raise_for_status()
+        return simulator_status_text()
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"**Simulator start failed:** `{type(exc).__name__}`"
+
+
+def stop_simulator_dashboard() -> str:
+    """Stop the simulator while retaining persisted synthetic readings."""
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(f"{API_BASE}/api/v1/simulator/stop")
+            response.raise_for_status()
+        return simulator_status_text()
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"**Simulator stop failed:** `{type(exc).__name__}`"
 
 
 # ── Parsing helpers ────────────────────────────────────────────────────────────
@@ -875,6 +933,257 @@ def run_simulation_for_dashboard() -> tuple[str, go.Figure, list[list[str | floa
 
 # ── Dashboard layout ──────────────────────────────────────────────────────────
 
+
+
+# ── Simulation pipeline data fetching ─────────────────────────────────────────
+
+def fetch_sim_pipeline_result() -> dict:
+    """Call the simulation pipeline endpoint and return the parsed JSON."""
+    try:
+        with httpx.Client(timeout=180.0) as client:
+            response = client.post(f"{API_BASE}/api/v1/simulator/pipeline")
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"pipeline_status": "error", "error": str(exc)}
+
+
+def fetch_latest_simulated_readings(limit: int = 30) -> list[dict]:
+    """Return the latest simulated readings from the API."""
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.get(
+                f"{API_BASE}/api/v1/simulator/readings",
+                params={"limit": limit},
+            )
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+
+
+# ── Live telemetry panel ───────────────────────────────────────────────────────
+
+def build_live_telemetry_panel() -> tuple[str, "go.Figure"]:
+    """Build the live telemetry status text and energy-trend chart."""
+    status_text = simulator_status_text()
+    readings = fetch_latest_simulated_readings(limit=60)
+    fig = go.Figure()
+    if not readings:
+        fig.update_layout(
+            title="Live Simulated Telemetry — No readings yet",
+            annotations=[dict(text="Start the simulator to generate readings.",
+                               x=0.5, y=0.5, xref="paper", yref="paper",
+                               showarrow=False, font=dict(size=14, color=SLATE))],
+            **CHART_LAYOUT,
+        )
+        return status_text, fig
+
+    times = [r.get("time") for r in readings if r.get("time")]
+    powers = [r.get("real_power_kw") for r in readings]
+    pfs = [r.get("power_factor_pct") for r in readings]
+    anomaly_marker = [bool(r.get("known_anomaly", False)) for r in readings]
+
+    fig.add_trace(go.Scatter(
+        x=times, y=powers, mode="lines+markers",
+        name="Live Real Power (kW)",
+        line=dict(color=NAVY, width=2),
+        marker=dict(color=[RED if a else NAVY for a in anomaly_marker], size=5),
+        hovertemplate="<b>%{x}</b><br>Power: %{y:.2f} kW<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=times, y=pfs, mode="lines",
+        name="Power Factor (%)",
+        yaxis="y2",
+        line=dict(color=TEAL, width=1.5, dash="dot"),
+        hovertemplate="<b>%{x}</b><br>PF: %{y:.1f}%<extra></extra>",
+    ))
+    # Mark known-anomaly intervals
+    for i, (t, is_anom) in enumerate(zip(times, anomaly_marker)):
+        if is_anom:
+            fig.add_vline(x=t, line_color=RED, line_width=1, opacity=0.3)
+
+    fig.update_layout(
+        title="Live Simulated Meter — One-Minute Readings (Ground-Truth Anomaly in Red)",
+        xaxis=dict(title="Time (UTC)", showgrid=True, gridcolor="#e8ecf5"),
+        yaxis=dict(title="Real Power (kW)", showgrid=True),
+        yaxis2=dict(title="Power Factor (%)", overlaying="y", side="right", range=[0, 110]),
+        **CHART_LAYOUT,
+    )
+    return status_text, fig
+
+
+# ── Model predictions panel ────────────────────────────────────────────────────
+
+def build_model_predictions_panel(pipeline: dict) -> str:
+    """Build the model-predictions HTML panel from pipeline API response."""
+    cafa = pipeline.get("cafa") or {}
+    grcf = pipeline.get("grcf") or {}
+    audit = pipeline.get("audit") or {}
+    adapter = pipeline.get("adapter_status", "unknown")
+    n_15 = pipeline.get("adapter_n_15min_rows", 0)
+    warnings_html = ""
+    for w in pipeline.get("adapter_warnings", []):
+        warnings_html += f'<li class="muted">&#9888; {w}</li>'
+
+    cafa_status = cafa.get("status", "unknown")
+    flagged = cafa.get("anomalies_flagged", 0)
+    mae = cafa.get("mae_kw", 0)
+    records = cafa.get("records_processed", 0)
+    cafa_err = cafa.get("error") or ""
+    status_color = GREEN if cafa_status == "ok" else AMBER if cafa_status == "no_anomalies" else RED
+    grcf_status = grcf.get("status", "unknown")
+    grcf_time = grcf.get("anomaly_time") or "—"
+    gt_count = audit.get("n_known_anomaly", 0)
+
+    return f"""
+    <div class="section-card">
+        <div class="section-badge badge-blue">MODEL PREDICTIONS</div>
+        <h2>CAFA Detection on Simulated Data</h2>
+        <p class="muted">
+            Ground-truth labels (<code>known_anomaly</code>) are kept <strong>separate</strong>
+            from all model inputs. The model predictions below are independent of the injected event.
+        </p>
+        <div class="kpi-strip">
+            <div class="kpi-card"><div class="kpi-value" style="color:{status_color}">{cafa_status.upper()}</div><div class="kpi-label">CAFA Status</div></div>
+            <div class="kpi-card"><div class="kpi-value">{records:,}</div><div class="kpi-label">Records (15-min)</div></div>
+            <div class="kpi-card"><div class="kpi-value" style="color:{RED if flagged>0 else GREEN}">{flagged}</div><div class="kpi-label">Anomalies Flagged</div></div>
+            <div class="kpi-card"><div class="kpi-value">{mae:.3f}</div><div class="kpi-label">XGBoost MAE (kW)</div></div>
+            <div class="kpi-card"><div class="kpi-value">{gt_count}</div><div class="kpi-label">Known-Anomaly Intervals</div></div>
+        </div>
+        <p class="muted">Adapter: <code>{adapter}</code> | 15-min rows: <code>{n_15}</code></p>
+        {('<ul>' + warnings_html + '</ul>') if warnings_html else ''}
+        {f'<p class="muted" style="color:{RED}">Error: {cafa_err}</p>' if cafa_err else ''}
+        <p class="muted">
+            GrCF explanation target: <code>{grcf_time}</code> (status: <code>{grcf_status}</code>)
+        </p>
+        <p class="muted" style="font-style:italic;">
+            &#9888; CAFA is re-trained on the simulated data at each pipeline run.
+            Results reflect this synthetic session only.
+        </p>
+    </div>"""
+
+
+# ── GrCF explanations panel ───────────────────────────────────────────────────
+
+def build_grcf_panel(pipeline: dict) -> str:
+    """Build the GrCF explanation HTML panel from pipeline API response."""
+    grcf = pipeline.get("grcf") or {}
+    status = grcf.get("status", "unknown")
+    anomaly_time = grcf.get("anomaly_time") or "—"
+    shape = grcf.get("counterfactual_shape") or []
+    changes = grcf.get("feature_changes") or []
+    error = grcf.get("error") or ""
+    elapsed = grcf.get("elapsed_s", 0)
+
+    if status != "ok":
+        return f"""
+        <div class="section-card">
+            <div class="section-badge badge-green">GrCF COUNTERFACTUAL</div>
+            <h2>GrCF Explanation</h2>
+            <p class="muted">Status: <code>{status}</code>{(" — " + error) if error else ""}</p>
+        </div>"""
+
+    rows_html = ""
+    for fc in sorted(changes, key=lambda x: abs(x.get("delta", 0)), reverse=True):
+        feat = fc.get("feature", "?")
+        delta = fc.get("delta", 0)
+        sign = "&#43;" if delta >= 0 else ""
+        cls = "delta-pos" if delta > 0 else "delta-neg"
+        rows_html += f"""
+        <tr>
+            <td class="tbl-label">{feat}</td>
+            <td class="tbl-delta {cls}">{sign}{delta:.4f}</td>
+        </tr>"""
+
+    shape_str = f"{shape[0]} &times; {shape[1]}" if len(shape) == 2 else "—"
+    return f"""
+    <div class="section-card">
+        <div class="section-badge badge-green">GrCF COUNTERFACTUAL</div>
+        <h2>What Should It Have Been? (Simulated)</h2>
+        <p class="muted">
+            GrCF generated a counterfactual for the window at <code>{anomaly_time}</code>.
+            Tensor shape: <code>{shape_str}</code> (steps &times; features).
+            Generation time: <code>{elapsed:.1f}s</code>.
+        </p>
+        <p class="muted">
+            Columns below show the delta <em>(counterfactual &minus; observed)</em>
+            for each GrCF feature. This is a model-generated alternative trajectory,
+            not a confirmed physical diagnosis.
+        </p>
+        <div class="table-wrap">
+            <table class="compare-table">
+                <thead><tr><th>Feature</th><th>CF &minus; Observed</th></tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+        </div>
+    </div>"""
+
+
+# ── CAFA audit panel ──────────────────────────────────────────────────────────
+
+def build_cafa_audit_panel(pipeline: dict) -> str:
+    """Build the CAFA audit HTML panel from pipeline API response."""
+    audit = pipeline.get("audit") or {}
+    status = audit.get("status", "unknown")
+    n_eval = audit.get("n_evaluated", 0)
+    tp = audit.get("n_true_positive", 0)
+    fp = audit.get("n_false_positive", 0)
+    fn = audit.get("n_false_negative", 0)
+    tn = audit.get("n_true_negative", 0)
+    recall = audit.get("recall")
+    precision = audit.get("precision")
+    f1 = audit.get("f1")
+    n_pos = audit.get("n_known_anomaly", 0)
+    n_flagged = audit.get("n_cafa_flagged", 0)
+    warnings = audit.get("warnings") or []
+    note = audit.get("note") or ""
+
+    badge_cls = "badge-green" if status == "ok" else "badge-red" if status == "insufficient_data" else "badge-blue"
+    warn_html = "".join(f'<li class="muted">&#9888; {w}</li>' for w in warnings)
+
+    def fmt_metric(v):
+        if v is None:
+            return "N/A"
+        return f"{v:.2%}"
+
+    return f"""
+    <div class="section-card">
+        <div class="section-badge {badge_cls}">CAFA AUDIT ({status.upper()})</div>
+        <h2>Model vs Ground-Truth Alignment</h2>
+        <p class="muted">
+            CAFA predictions are aligned with <code>known_anomaly</code> ground-truth labels.
+            Labels are from the simulated event injection — not from model outputs.
+        </p>
+        <div class="kpi-strip">
+            <div class="kpi-card"><div class="kpi-value">{n_eval:,}</div><div class="kpi-label">Evaluated Observations</div></div>
+            <div class="kpi-card"><div class="kpi-value">{n_pos}</div><div class="kpi-label">Known-Anomaly Intervals</div></div>
+            <div class="kpi-card"><div class="kpi-value" style="color:{GREEN}">{n_flagged}</div><div class="kpi-label">CAFA Flagged</div></div>
+            <div class="kpi-card"><div class="kpi-value" style="color:{GREEN}">{tp}</div><div class="kpi-label">True Positives</div></div>
+            <div class="kpi-card"><div class="kpi-value" style="color:{RED}">{fp}</div><div class="kpi-label">False Positives</div></div>
+            <div class="kpi-card"><div class="kpi-value" style="color:{AMBER}">{fn}</div><div class="kpi-label">False Negatives</div></div>
+        </div>
+        <div class="kpi-strip">
+            <div class="kpi-card"><div class="kpi-value">{fmt_metric(recall)}</div><div class="kpi-label">Recall</div></div>
+            <div class="kpi-card"><div class="kpi-value">{fmt_metric(precision)}</div><div class="kpi-label">Precision</div></div>
+            <div class="kpi-card"><div class="kpi-value">{fmt_metric(f1)}</div><div class="kpi-label">F1 Score</div></div>
+        </div>
+        {('<ul>' + warn_html + '</ul>') if warn_html else ''}
+        {f'<p class="muted" style="font-style:italic;">{note}</p>' if note else ''}
+    </div>"""
+
+
+# ── Pipeline refresh ──────────────────────────────────────────────────────────
+
+def refresh_pipeline_panels() -> tuple[str, str, str]:
+    """Fetch pipeline results and rebuild the three new panels."""
+    pipeline = fetch_sim_pipeline_result()
+    return (
+        build_model_predictions_panel(pipeline),
+        build_grcf_panel(pipeline),
+        build_cafa_audit_panel(pipeline),
+    )
+
 def build_dashboard() -> gr.Blocks:
     """Construct the full judge-ready ENTWINE dashboard."""
 
@@ -919,6 +1228,17 @@ def build_dashboard() -> gr.Blocks:
                 "Click Refresh to re-poll for the latest anomaly event._",
                 elem_classes=["muted"],
             )
+
+        gr.HTML("""
+        <div class="section-card">
+            <div class="section-badge badge-amber">SIMULATED LIVE METER</div>
+            <h2>One-Minute Demonstration Stream</h2>
+            <p class="muted">Synthetic readings are stored separately from real historical telemetry. The injected ground-truth event is shown separately from any future model prediction.</p>
+        </div>""")
+        with gr.Row():
+            start_simulator_btn = gr.Button("Start Simulator", elem_classes=["refresh-btn"])
+            stop_simulator_btn = gr.Button("Stop Simulator", elem_classes=["refresh-btn"])
+        simulator_status = gr.Markdown(value=simulator_status_text(), elem_classes=["simulation-report"])
 
         # ── Section 1: What Was Detected ─────────────────────────────────────
         alert_html = gr.HTML(value=init_alert)
@@ -999,16 +1319,86 @@ def build_dashboard() -> gr.Blocks:
             label="Observed vs GrCF alternative",
         )
 
+        # ── Section 7: Live Telemetry Panel ──────────────────────────────────
+        gr.HTML("""
+        <div class="section-card">
+            <div class="section-badge badge-amber">LIVE TELEMETRY</div>
+            <h2>One-Minute Simulated Readings</h2>
+            <p class="muted">
+                Latest readings from the live-meter service (1-min cadence).<br>
+                <strong>Red markers</strong> = ground-truth injected anomaly interval
+                (this is known metadata — not a model prediction).
+            </p>
+        </div>""")
+        live_status_md = gr.Markdown(value=simulator_status_text(), elem_classes=["simulation-report"])
+        live_telem_chart = gr.Plot(label="Live Simulated Telemetry")
+
+        # ── Section 8: Model Predictions Panel ──────────────────────────────
+        gr.HTML("""
+        <div class="section-card">
+            <div class="section-badge badge-blue">PIPELINE RUNNER</div>
+            <h2>Run Full Integration Pipeline</h2>
+            <p class="muted">
+                Runs adapter resampling → CAFA → GrCF → GridReason → Audit.
+                Uses the 14-day built-in simulation when live data is insufficient.
+                CPU-intensive: expect 30–120 seconds.
+            </p>
+        </div>""")
+        run_pipeline_btn = gr.Button("Run Full Simulation Pipeline", elem_classes=["refresh-btn"])
+        pipeline_status_md = gr.Markdown(
+            "Click **Run Full Simulation Pipeline** to execute CAFA, GrCF, and the audit.",
+            elem_classes=["simulation-report"],
+        )
+        predictions_html = gr.HTML(value="<div class='section-card'><p class='muted'>Pipeline not yet run.</p></div>")
+        grcf_panel_html = gr.HTML(value="<div class='section-card'><p class='muted'>GrCF panel will appear after pipeline run.</p></div>")
+        audit_panel_html = gr.HTML(value="<div class='section-card'><p class='muted'>Audit panel will appear after pipeline run.</p></div>")
+
         # ── Wire up Refresh ───────────────────────────────────────────────────
         outputs = [kpis, alert_html, method_html, power_chart, pf_chart,
                comp_chart, monthly_chart, table_html, tensor_df]
 
         dashboard.load(fn=refresh_all, inputs=[], outputs=outputs)
         refresh_btn.click(fn=refresh_all, inputs=[], outputs=outputs)
+
+        # Live telemetry panel wiring
+        def _refresh_live():
+            status_txt, fig = build_live_telemetry_panel()
+            return status_txt, fig
+
+        dashboard.load(fn=_refresh_live, inputs=[], outputs=[live_status_md, live_telem_chart])
+        start_simulator_btn.click(
+            fn=lambda: build_live_telemetry_panel(),
+            inputs=[],
+            outputs=[live_status_md, live_telem_chart],
+        )
+
+        def _run_pipeline_and_refresh():
+            pipeline = fetch_sim_pipeline_result()
+            summary = pipeline.get("summary", "Pipeline complete.")
+            pred = build_model_predictions_panel(pipeline)
+            grcf = build_grcf_panel(pipeline)
+            audit = build_cafa_audit_panel(pipeline)
+            return summary, pred, grcf, audit
+
+        run_pipeline_btn.click(
+            fn=_run_pipeline_and_refresh,
+            inputs=[],
+            outputs=[pipeline_status_md, predictions_html, grcf_panel_html, audit_panel_html],
+        )
         simulate_btn.click(
             fn=run_simulation_for_dashboard,
             inputs=[],
             outputs=[simulation_report, simulation_chart, simulation_table],
+        )
+        start_simulator_btn.click(
+            fn=start_simulator_dashboard,
+            inputs=[],
+            outputs=[simulator_status],
+        )
+        stop_simulator_btn.click(
+            fn=stop_simulator_dashboard,
+            inputs=[],
+            outputs=[simulator_status],
         )
 
     return dashboard

@@ -194,3 +194,40 @@ remain row-based.
 The dashboard also contains a **Test With Simulated Live Meter Data** section.
 It runs this experiment only when its button is clicked, so the existing
 database-backed dashboard view is not replaced.
+
+---
+
+## 10. Configurable One-Minute Live-Meter Demonstration
+
+The feature branch also provides a controllable simulator for demonstration
+workflows. It generates one synthetic PH-A-MAIN reading per simulated minute,
+marks the configured abnormal interval as ground truth, and stores synthetic
+records separately in `simulated_telemetry`. Real historical `state_telemetry`
+and `anomaly_events` records are not overwritten.
+
+Start the API and use the lifecycle endpoints:
+
+```powershell
+# Start a 15-minute demonstration with an abnormal event beginning at minute 5
+Invoke-RestMethod -Method Post `
+   -Uri http://127.0.0.1:8000/api/v1/simulator/start `
+   -ContentType "application/json" `
+   -Body '{"simulation_id":"demo-ph-a","duration_minutes":15,"interval_seconds":60,"abnormal_start_minute":5,"abnormal_duration_minutes":4,"random_seed":20261030}'
+
+# Inspect status and counters
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/simulator/status
+
+# Stop without deleting simulated records
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/v1/simulator/stop
+```
+
+For development, set `interval_seconds` to a small value such as `0.05` to
+accelerate wall-clock execution. The timestamps still advance by exactly one
+simulated minute per generated reading. The service records both
+`known_anomaly` (injected ground truth) and model results separately; the
+ground-truth flag is never passed into CAFA features.
+
+The existing CAFA/GrCF validation command remains a separate batch experiment:
+it uses the mentor-compatible 15-minute row cadence and unchanged model lag and
+rolling semantics. This distinction prevents an accelerated one-minute demo
+from being presented as a fresh reproduction of the historical model metrics.
